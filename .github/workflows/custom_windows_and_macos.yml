@@ -1,0 +1,229 @@
+name: Build RustDesk (Windows + macOS)
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ main ]
+
+env:
+  # 🔧 Versiones de toolchains usadas por el repo oficial
+  SCITER_RUST_VERSION: "1.75"
+  MAC_RUST_VERSION: "1.81"
+  FLUTTER_VERSION: "3.24.5"
+  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+  VERSION: "1.4.3"
+  TAG_NAME: "nightly"
+  UPLOAD_ARTIFACT: "true"
+
+  # 🔐 Tus claves/servidor desde Secrets (ajusta en Settings → Secrets and variables → Actions)
+  RS_PUB_KEY: ${{ secrets.RS_PUB_KEY }}
+  RENDEZVOUS_SERVER: ${{ secrets.RENDEZVOUS_SERVER }}
+  SIGN_BASE_URL: ${{ secrets.SIGN_BASE_URL }}
+  SIGN_SECRET_KEY: ${{ secrets.SIGN_SECRET_KEY }}
+  MACOS_P12_BASE64: ${{ secrets.MACOS_P12_BASE64 }}
+  MACOS_P12_PASSWORD: ${{ secrets.MACOS_P12_PASSWORD }}
+  MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+  MACOS_NOTARIZE_JSON: ${{ secrets.MACOS_NOTARIZE_JSON }}
+
+jobs:
+  # (Opcional) Generar bridge si tu repo lo necesita. Si no, elimina este job y la dependencia.
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
+
+  # ----------------------------- WINDOWS (Flutter, portable exe + MSI) -----------------------------
+  build-for-windows-flutter:
+    name: Windows x64 (portable exe + MSI)
+    runs-on: windows-2022
+    needs: [generate-bridge]
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      ARCH: x86_64
+      VCPKG_TRIPLET: x64-windows-static
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with: { submodules: recursive }
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@master
+        with: { name: bridge-artifact, path: ./ }
+        continue-on-error: true
+
+      - name: Rust toolchain (MSVC)
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.SCITER_RUST_VERSION }}
+          targets: ${{ env.TARGET }}
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+
+      - name: Install vcpkg deps (Windows)
+        shell: bash
+        env: { VCPKG_DEFAULT_HOST_TRIPLET: ${{ env.VCPKG_TRIPLET }} }
+        run: |
+          $VCPKG_ROOT/vcpkg install --triplet ${{ env.VCPKG_TRIPLET }} --x-install-root="$VCPKG_ROOT/installed"
+
+      - name: Install LLVM & Flutter
+        uses: KyleMayes/install-llvm-action@v1
+        with: { version: "15.0.6" }
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      # (parche/engine custom si tu repo lo requiere; deja tal cual si ya te funciona)
+      - name: Precache Flutter
+        run: flutter doctor -v
+
+      # ⚙️ BUILD con tus RS_PUB_KEY y RENDEZVOUS_SERVER en el entorno
+      - name: Build (portable + MSI)
+        shell: bash
+        run: |
+          python3 ./build.py --portable --hwcodec --flutter --vram --skip-portable-pack
+          mv ./flutter/build/windows/x64/runner/Release ./rustdesk
+
+      - name: Bundle usbmmidd & printer driver (opcional)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
+          Expand-Archive usbmmidd_v2.zip -DestinationPath .
+          Remove-Item -Path usbmmidd_v2\Win32 -Recurse -ErrorAction SilentlyContinue
+          mv -Force .\usbmmidd_v2 .\rustdesk
+          try {
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/rustdesk_printer_driver_v4-1.4.zip -OutFile drv.zip
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/printer_driver_adapter.zip -OutFile adp.zip
+            Expand-Archive drv.zip -DestinationPath .
+            mkdir rustdesk\drivers
+            mv -Force .\rustdesk_printer_driver_v4-1.4 .\rustdesk\drivers\RustDeskPrinterDriver
+            Expand-Archive adp.zip -DestinationPath .
+            mv -Force .\printer_driver_adapter.dll .\rustdesk
+          } catch { Write-Host "Skip printer drivers" }
+
+      - name: Self-extracted portable EXE
+        shell: bash
+        run: |
+          sed -i '/dpiAware/d' res/manifest.xml
+          pushd ./libs/portable
+          pip3 install -r requirements.txt
+          python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
+          popd
+          mkdir -p ./SignOutput
+          mv ./target/release/rustdesk-portable-packer.exe ./SignOutput/rustdesk-${{ env.VERSION }}-${{ env.ARCH }}.exe
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build MSI
+        run: |
+          pushd ./res/msi
+          python preprocess.py --arp -d ../../rustdesk
+          nuget restore msi.sln
+          msbuild msi.sln -p:Configuration=Release -p:Platform=x64 /p:TargetVersion=Windows10
+          mkdir -p ../../SignOutput
+          mv ./Package/bin/x64/Release/en-us/Package.msi ../../SignOutput/rustdesk-${{ env.VERSION }}-${{ env.ARCH }}.msi
+
+      - name: (Opcional) Firma
+        if: env.SIGN_BASE_URL != ''
+        shell: bash
+        run: |
+          pip3 install requests argparse
+          BASE_URL="${SIGN_BASE_URL}" SECRET_KEY="${SIGN_SECRET_KEY}" python3 res/job.py sign_files ./SignOutput
+
+      - name: Publicar artefactos Windows
+        uses: softprops/action-gh-release@v1
+        with:
+          prerelease: true
+          tag_name: ${{ env.TAG_NAME }}
+          files: |
+            ./SignOutput/rustdesk-*.msi
+            ./SignOutput/rustdesk-*.exe
+
+  # ----------------------------- macOS (DMG) -----------------------------
+  build-for-macOS:
+    name: macOS (x64 + arm64, DMG)
+    runs-on: ${{ matrix.os }}
+    needs: [generate-bridge]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-apple-darwin, os: macos-13, arch: x86_64, vcpkg: x64-osx, extra: "" }
+          - { target: aarch64-apple-darwin, os: macos-14, arch: aarch64, vcpkg: arm64-osx, extra: "--screencapturekit" }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with: { submodules: recursive }
+
+      - name: Import cert (opcional, para firmar)
+        if: env.MACOS_P12_BASE64 != null
+        uses: apple-actions/import-codesign-certs@v1
+        with:
+          p12-file-base64: ${{ env.MACOS_P12_BASE64 }}
+          p12-password: ${{ env.MACOS_P12_PASSWORD }}
+          keychain: rustdesk
+
+      - name: Install tooling
+        run: |
+          brew install llvm create-dmg nasm
+          command -v pkg-config >/dev/null || brew install pkg-config
+
+      - name: Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.MAC_RUST_VERSION }}
+          targets: ${{ matrix.target }}
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build macOS (DMG)
+        shell: bash
+        run: |
+          # Ajuste de despliegue mínimo si compilas arm64
+          if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
+            MIN=12.3
+            sed -i -e "s/MACOSX_DEPLOYMENT_TARGET\=[0-9]*\.[0-9]*/MACOSX_DEPLOYMENT_TARGET=${MIN}/" build.py
+            sed -i -e "s/platform :osx, '.*'/platform :osx, '${MIN}'/" flutter/macos/Podfile
+            sed -i -e "s/osx_minimum_system_version = \"[0-9]*\.[0-9]*\"/osx_minimum_system_version = \"${MIN}\"/" Cargo.toml
+            sed -i -e "s/MACOSX_DEPLOYMENT_TARGET = [0-9]*\.[0-9]*;/MACOSX_DEPLOYMENT_TARGET = ${MIN};/" flutter/macos/Runner.xcodeproj/project.pbxproj
+          fi
+          # 💡 RS_PUB_KEY y RENDEZVOUS_SERVER ya están en env → se embeben en el binario
+          ./build.py --flutter --hwcodec --unix-file-copy-paste ${{ matrix.extra }}
+
+          CREATE_DMG="$(command -v create-dmg)"
+          sed -i -e 's/MAXIMUM_UNMOUNTING_ATTEMPTS=3/MAXIMUM_UNMOUNTING_ATTEMPTS=7/' "$(readlink -f "$CREATE_DMG")"
+          create-dmg --icon "RustDesk.app" 200 190 --hide-extension "RustDesk.app" --window-size 800 400 --app-drop-link 600 185 rustdesk-${{ env.VERSION }}-${{ matrix.arch }}.dmg ./flutter/build/macos/Build/Products/Release/RustDesk.app
+
+      - name: (Opcional) Firmar + Notarizar
+        if: env.MACOS_P12_BASE64 != null
+        run: |
+          security default-keychain -s rustdesk.keychain
+          codesign --force --options runtime -s "${{ env.MACOS_CODESIGN_IDENTITY }}" --deep --strict rustdesk-${{ env.VERSION }}-${{ matrix.arch }}.dmg -vvv
+          # Notarización (si configuraste rustdesk.json)
+          if [ -n "${{ env.MACOS_NOTARIZE_JSON }}" ]; then
+            wget https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F0.22.0/apple-codesign-0.22.0-macos-universal.tar.gz -O - | tar -xz
+            ./apple-codesign-0.22.0-macos-universal/rcodesign notary-submit --api-key-path ${{ github.workspace }}/rustdesk.json --staple rustdesk-${{ env.VERSION }}-${{ matrix.arch }}.dmg
+          fi
+
+      - name: Publicar artefacto macOS
+        uses: softprops/action-gh-release@v1
+        with:
+          prerelease: true
+          tag_name: ${{ env.TAG_NAME }}
+          files: |
+            rustdesk-${{ env.VERSION }}-${{ matrix.arch }}.dmg
