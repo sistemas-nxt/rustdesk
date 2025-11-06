@@ -125,16 +125,23 @@ jobs:
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '17.0'   # VS 2022
 
       - name: Build MSI
-        shell: bash
+        shell: pwsh
         run: |
-          pushd ./res/msi
-          python preprocess.py --arp -d ../../rustdesk
+          Set-StrictMode -Version Latest
+          Push-Location .\res\msi
+          python preprocess.py --arp -d ..\..\rustdesk
           nuget restore msi.sln
-          msbuild msi.sln -p:Configuration=Release -p:Platform=x64 /p:TargetVersion=Windows10
-          mkdir -p ../../SignOutput
-          mv ./Package/bin/x64/Release/en-us/Package.msi ../../SignOutput/rustdesk-${{ env.VERSION }}-x86_64.msi
+          # Localiza MSBuild.exe mediante vswhere y ejecútalo
+          $msbuild = vswhere -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe | Select-Object -First 1
+          if (-not $msbuild) { throw "MSBuild.exe not found" }
+          & "$msbuild" msi.sln /p:Configuration=Release /p:Platform=x64 /p:TargetVersion=Windows10 /m
+          Pop-Location
+          New-Item -ItemType Directory -Force -Path .\SignOutput | Out-Null
+          Move-Item .\res\msi\Package\bin\x64\Release\en-us\Package.msi .\SignOutput\rustdesk-${{ env.VERSION }}-x86_64.msi -Force
 
       - name: (Opcional) Firmar artefactos
         if: env.SIGN_BASE_URL != ''
@@ -161,32 +168,34 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Intel runner actualizado
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-15-intel
             arch: x86_64
+            min_macos: "10.13"     # ajusta si quieres soportar menos versiones
             extra: ""
+          # Arm runner recomendado
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-latest       # macOS 15 arm64
             arch: aarch64
+            min_macos: "12.3"      # requerido por screencapturekit
             extra: "--screencapturekit"
+    env:
+      # Fija el despliegue mínimo en ENTORNO, sin tocar Xcodeproj/Podfile
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.min_macos }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Import cert (opcional)
-        if: env.MACOS_P12_BASE64 != null
-        uses: apple-actions/import-codesign-certs@v1
-        with:
-          p12-file-base64: ${{ env.MACOS_P12_BASE64 }}
-          p12-password: ${{ env.MACOS_P12_PASSWORD }}
-          keychain: rustdesk
-
-      - name: Install tooling
+      - name: Tooling
         run: |
-          brew install llvm create-dmg nasm
-          if ! command -v pkg-config >/dev/null; then brew install pkg-config; fi
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          brew install llvm create-dmg nasm || true
+          command -v pkg-config >/dev/null || brew install pkg-config
+          swift --version || true
+          xcodebuild -version || true
 
       - name: Flutter
         uses: subosito/flutter-action@v2
@@ -201,38 +210,35 @@ jobs:
           targets: ${{ matrix.target }}
           components: rustfmt
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build macOS (DMG)
         shell: bash
+        env:
+          # asegura que clang/llvm estén visibles si hiciera falta
+          PATH: "/usr/local/opt/llvm/bin:${PATH}"
         run: |
-          if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
-            MIN=12.3
-            sed -i -e "s/MACOSX_DEPLOYMENT_TARGET\=[0-9]*\.[0-9]*/MACOSX_DEPLOYMENT_TARGET=${MIN}/" build.py
-            sed -i -e "s/platform :osx, '.*'/platform :osx, '${MIN}'/" flutter/macos/Podfile
-            sed -i -e "s/osx_minimum_system_version = \"[0-9]*\.[0-9]*\"/osx_minimum_system_version = \"${MIN}\"/" Cargo.toml
-            sed -i -e "s/MACOSX_DEPLOYMENT_TARGET = [0-9]*\.[0-9]*;/MACOSX_DEPLOYMENT_TARGET = ${MIN};/" flutter/macos/Runner.xcodeproj/project.pbxproj
-          fi
-          ./build.py --flutter --hwcodec --unix-file-copy-paste ${{ matrix.extra }}
+          set -euo pipefail
+          echo "Target: ${{ matrix.target }}  Arch: ${{ matrix.arch }}  MIN: $MACOSX_DEPLOYMENT_TARGET"
+          flutter doctor -v
+          # Construye con tus env vars (RS_PUB_KEY / RENDEZVOUS_SERVER ya están en env)
+          ./build.py --flutter --hwcodec --unix-file-copy-paste ${{ matrix.extra }} 2>&1 | tee build-macos-${{ matrix.arch }}.log
 
+          # Empaquetar DMG
           CREATE_DMG="$(command -v create-dmg)"
           CREATE_DMG_PATH="$(readlink -f "$CREATE_DMG")"
-          sed -i -e 's/MAXIMUM_UNMOUNTING_ATTEMPTS=3/MAXIMUM_UNMOUNTING_ATTEMPTS=7/' "$CREATE_DMG_PATH"
-          create-dmg --icon "RustDesk.app" 200 190 --hide-extension "RustDesk.app" --window-size 800 400 --app-drop-link 600 185 rustdesk-${{ env.VERSION }}-${{ matrix.arch }}.dmg ./flutter/build/macos/Build/Products/Release/RustDesk.app
+          sed -i -e 's/MAXIMUM_UNMOUNTING_ATTEMPTS=3/MAXIMUM_UNMOUNTING_ATTEMPTS=7/' "$CREATE_DMG_PATH" || true
+          APP_PATH="./flutter/build/macos/Build/Products/Release/RustDesk.app"
+          test -d "$APP_PATH" || { echo "::error::No se encontró $APP_PATH"; exit 1; }
+          create-dmg \
+            --icon "RustDesk.app" 200 190 \
+            --hide-extension "RustDesk.app" \
+            --window-size 800 400 \
+            --app-drop-link 600 185 \
+            rustdesk-${{ env.VERSION }}-${{ matrix.arch }}.dmg \
+            "$APP_PATH"
 
-      - name: (Opcional) Firmar + Notarizar
-        if: env.MACOS_P12_BASE64 != null
-        run: |
-          security default-keychain -s rustdesk.keychain
-          codesign --force --options runtime -s "${MACOS_CODESIGN_IDENTITY}" --deep --strict rustdesk-${{ env.VERSION }}-${{ matrix.arch }}.dmg -vvv
-          if [ -n "${MACOS_NOTARIZE_JSON}" ]; then
-            curl -L -o apple-codesign.tar.gz https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F0.22.0/apple-codesign-0.22.0-macos-universal.tar.gz
-            tar -xzf apple-codesign.tar.gz
-            ./apple-codesign-0.22.0-macos-universal/rcodesign notary-submit --api-key-path "${GITHUB_WORKSPACE}/rustdesk.json" --staple rustdesk-${{ env.VERSION }}-${{ matrix.arch }}.dmg
-          fi
-
-      - name: Publicar artefacto macOS
+      - name: Subir DMG (unsigned)
         uses: softprops/action-gh-release@v1
         with:
           prerelease: true
